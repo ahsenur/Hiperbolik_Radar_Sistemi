@@ -2,107 +2,162 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from turtlesim.msg import Pose
-from turtlesim.srv import Spawn
-import numpy as np
+from turtlesim.srv import Spawn, Kill
 import math
 
 
 class AvciIHA(Node):
     def __init__(self):
-        super().__init__('avci_iha_node')
+        super().__init__('kontrol')
+        self.pub = self.create_publisher(Twist, 'turtle1/cmd_vel', 10)
+        self.subscriber_avci = self.create_subscription(Pose, 'turtle1/pose', self.avci_cb, 10)
 
-        self.publisher_ = self.create_publisher(Twist, 'turtle1/cmd_vel', 10)
-        self.subscriber_avci = self.create_subscription(Pose, 'turtle1/pose', self.avci_pose_cb, 10)
-        self.subscriber_dusman = self.create_subscription(Pose, 'turtle2/pose', self.dusman_pose_cb, 10)
+        self.engeller = {}
+        self.pose = None
+        self.operasyon_tamam = False
+        self.hedefler_yuklendi = False
+        self.manevra_basladi = False
+        self.turtle5_pasif = False
+        self.son_sn = -1
+        self.aktif_hedef_adi = ""
 
-        self.avci_pose = None
-        self.dusman_pose = None
-        self.a = 2.0  # Poster: Hiperbol parametresi [cite: 12]
-        self.b = 1.5
-        self.hedef_vuruldu = False
-        self.mod = "TAKIP"
+        self.kill_client = self.create_client(Kill, 'kill')
+        self.spawn_timer = self.create_timer(1.0, self.spawner)
+        self.loop_timer = self.create_timer(0.1, self.kontrol)
+        self.onay_timer = None
 
-        # Safe Zone parametreleri
-        self.merkez_x = 5.5
-        self.merkez_y = 5.5
-        self.guvenlik_yaricap = 3.0
+    def avci_cb(self, msg):
+        self.pose = msg
 
-        # Hedefi (turtle2) oluşturma servisi
-        self.spawn_client = self.create_client(Spawn, 'spawn')
-        while not self.spawn_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Simülasyon servisinin açılması bekleniyor...')
+    def spawner(self):
+        self.spawn_timer.cancel()
+        client = self.create_client(Spawn, 'spawn')
+        # Konumlar optimize edildi
+        pozisyonlar = [(9.5, 9.5, 'turtle2'), (1.0, 10.0, 'turtle3'), (10.0, 1.0, 'turtle4'), (2.5, 2.5, 'turtle5')]
+        for x, y, name in pozisyonlar:
+            client.call_async(Spawn.Request(x=x, y=y, theta=0.0, name=name))
 
-        self.dusman_yarat()
-        self.timer = self.create_timer(0.1, self.kontrol_dongusu)
+            def make_cb(n): return lambda msg, name=n: self.engeller.update({name: msg})
 
-    def dusman_yarat(self):
-        request = Spawn.Request()
-        request.x = 8.5
-        request.y = 8.5
-        request.name = 'turtle2'  # Hedef kaplumbağa ismi
-        self.spawn_client.call_async(request)
+            self.create_subscription(Pose, f'{name}/pose', make_cb(name), 10)
 
-    def avci_pose_cb(self, msg):
-        self.avci_pose = msg
+        self.onay_timer = self.create_timer(2.0, self.onay_ver)
 
-    def dusman_pose_cb(self, msg):
-        self.dusman_pose = msg
+    def onay_ver(self):
+        if not self.operasyon_tamam:
+            self.hedefler_yuklendi = True
+            self.get_logger().info("🚀 RADAR AKTİF. TEHDİT ANALİZİ BAŞLATILDI...")
 
-    def delta_analizi(self):
-        # Poster: Delta = 4a^2b^2(n^2 + b^2 - a^2m^2) [cite: 19, 58]
-        if self.dusman_pose is None: return None
-        m = math.tan(self.dusman_pose.theta)
-        n = self.dusman_pose.y - m * self.dusman_pose.x
-        delta = 4 * (self.a ** 2) * (self.b ** 2) * (n ** 2 + self.b ** 2 - (self.a ** 2) * (m ** 2))
-        return delta
+    def log_saniye(self, ad, mesafe):
+        # Saniye hesaplama
+        sn = int(math.ceil(mesafe / 1.0))
 
-    def kontrol_dongusu(self):
-        # Eğer hedef henüz oluşmadıysa veya vurulduysa işlem yapma
-        if self.avci_pose is None or self.dusman_pose is None or self.hedef_vuruldu:
+        # Eğer yeni bir hedefe geçildiyse başlık at
+        if ad != self.aktif_hedef_adi:
+            self.aktif_hedef_adi = ad
+            self.son_sn = sn
+            self.get_logger().info(f"🎯 HEDEF SEÇİLDİ: {ad.upper()} | ANALİZ SÜRESİ: {sn} SN")
+            # Bir alt satır hissi için boşluk (isteğe bağlı)
             return
 
+        # Saniye azaldıkça alt satıra yaz
+        if sn < self.son_sn and sn > 0:
+            self.get_logger().warn(f"   ➔ Kalan Süre: {sn} sn")
+            self.son_sn = sn
+
+    def kontrol(self):
+        if self.pose is None or self.operasyon_tamam or not self.hedefler_yuklendi:
+            return
+
+        imha_listesi = [ad for ad in self.engeller.keys() if ad != 'turtle5']
+
+        # --- EVE DÖNÜŞ VE SİSTEMİ DURDURMA ---
+        if not imha_listesi and self.turtle5_pasif:
+            dist_home = math.sqrt((5.5 - self.pose.x) ** 2 + (5.5 - self.pose.y) ** 2)
+            if dist_home < 0.2:
+                self.operasyon_tamam = True
+                self.pub.publish(Twist())
+                if self.onay_timer: self.onay_timer.cancel()
+
+                print("\n" + "★" * 60)
+                self.get_logger().info("✅ OPERASYON BAŞARIYLA TAMAMLANDI!")
+                self.get_logger().info("🏠 İHA GÜVENLİ BÖLGEYE (ÜSSE) DÖNDÜ. SİSTEM KAPALI.")
+                print("★" * 60 + "\n")
+                return
+            else:
+                msg = Twist()
+                angle = math.atan2(5.5 - self.pose.y, 5.5 - self.pose.x)
+                msg.linear.x = 2.0
+                diff = angle - self.pose.theta
+                while diff > math.pi: diff -= 2 * math.pi
+                while diff < -math.pi: diff += 2 * math.pi
+                msg.angular.z = 5.0 * diff
+                self.pub.publish(msg)
+                return
+
+        # Hedef Seçimi
+        if imha_listesi:
+            en_yakin_ad = min(imha_listesi, key=lambda ad: math.sqrt(
+                (self.engeller[ad].x - self.pose.x) ** 2 + (self.engeller[ad].y - self.pose.y) ** 2))
+        elif 'turtle5' in self.engeller and not self.turtle5_pasif:
+            en_yakin_ad = 'turtle5'
+        else:
+            return
+
+        p = self.engeller[en_yakin_ad]
+        min_dist = math.sqrt((p.x - self.pose.x) ** 2 + (p.y - self.pose.y) ** 2)
+
+        # Saniye mantığını çalıştır
+        self.log_saniye(en_yakin_ad, min_dist)
+
         msg = Twist()
-        delta = self.delta_analizi()
+        # --- TURTLE5 ÖZEL MANEVRA ---
+        if en_yakin_ad == 'turtle5' and (min_dist < 2.0 or self.manevra_basladi):
+            if not self.manevra_basladi:
+                self.get_logger().error(f"🚨 DİKKAT: {en_yakin_ad.upper()} ETKİSİZ HALE GETİRİLEMİYOR!")
+                self.get_logger().warn("🔄 HİPERBOLİK KAÇIŞ MANEVRASI UYGULANIYOR...")
+                self.manevra_basladi = True
 
-        # Mesafe ve Açı Hesaplama
-        dx = self.dusman_pose.x - self.avci_pose.x
-        dy = self.dusman_pose.y - self.avci_pose.y
-        mesafe = math.sqrt(dx ** 2 + dy ** 2)
-        hedef_aci = math.atan2(dy, dx)
+            angle_to_home = math.atan2(5.5 - self.pose.y, 5.5 - self.pose.x)
+            msg.linear.x = 2.5
+            diff = angle_to_home - self.pose.theta
+            msg.angular.z = 4.0 * diff
 
-        # Açı Normalizasyonu (Düz gitme sorununu çözer)
-        aci_farki = hedef_aci - self.avci_pose.theta
-        while aci_farki > math.pi: aci_farki -= 2.0 * math.pi
-        while aci_farki < -math.pi: aci_farki += 2.0 * math.pi
-
-        # Poster: Güvenli-Kritik-Tehlikeli Bölge Analizi
-        mesafe_merkez = math.sqrt((self.dusman_pose.x - self.merkez_x) ** 2 + (self.dusman_pose.y - self.merkez_y) ** 2)
-
-        if mesafe_merkez < self.guvenlik_yaricap:
-            self.mod = "SAVUNMA"  # Kritik müdahale bölgesi [cite: 29]
-            hiz_kat_sayisi = 3.0
-        elif delta is not None and delta > 0:
-            self.mod = "RISK"  # Delta > 0 ise iletişim kesilecek tahmini [cite: 61]
-            hiz_kat_sayisi = 2.2
+            if min_dist > 3.5:
+                self.get_logger().info("✅ MANEVRA BAŞARILI. TEHDİT BÖLGESİ TERK EDİLDİ.")
+                self.turtle5_pasif = True
+                self.manevra_basladi = False
         else:
-            self.mod = "TAKIP"
-            hiz_kat_sayisi = 1.5
+            # Standart Takip
+            if min_dist > 0.8:
+                angle = math.atan2(p.y - self.pose.y, p.x - self.pose.x)
+                msg.linear.x = 2.2
+                diff = angle - self.pose.theta
+                while diff > math.pi: diff -= 2 * math.pi
+                while diff < -math.pi: diff += 2 * math.pi
+                msg.angular.z = 6.0 * diff
+            else:
+                if en_yakin_ad in self.engeller:
+                    self.get_logger().info(f"💥 {en_yakin_ad.upper()} ETKİSİZ HALE GETİRİLDİ!")
+                    name = en_yakin_ad
+                    del self.engeller[en_yakin_ad]
+                    self.kill_client.call_async(Kill.Request(name=name))
 
-        if mesafe > 0.6:
-            # Hiperbolik yaklaşma hızı [cite: 106]
-            msg.linear.x = hiz_kat_sayisi * np.tanh(mesafe)
-            msg.angular.z = 6.0 * aci_farki
-            self.publisher_.publish(msg)
-        else:
-            self.hedef_vuruldu = True
-            self.get_logger().info("HEDEF ETKİSİZ HALE GETİRİLDİ!")  # Müdahale Başarılı [cite: 64]
+        self.pub.publish(msg)
 
 
-def main():
-    rclpy.init()
+def main(args=None):
+    rclpy.init(args=args)
     node = AvciIHA()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    rclpy.shutdown()
+    finally:
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
